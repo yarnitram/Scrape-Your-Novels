@@ -52,11 +52,46 @@ document.addEventListener('DOMContentLoaded', () => {
                 // Populate the list
                 novels.forEach(novel => {
                     const listItem = document.createElement('li');
-                    const link = document.createElement('a');
-                    link.href = novel.source_url;
-                    link.textContent = novel.title;
-                    link.target = '_blank'; // Open link in new tab
-                    listItem.appendChild(link);
+
+                    // Add Cover Image
+                    if (novel.cover_image_url) {
+                        const coverImage = document.createElement('img');
+                        coverImage.src = novel.cover_image_url;
+                        coverImage.alt = `${novel.title} Cover`;
+                        coverImage.style.width = '100px'; // Example styling
+                        coverImage.style.marginRight = '10px';
+                        listItem.appendChild(coverImage);
+                    }
+
+                    // Add Title (as a link)
+                    const titleLink = document.createElement('a');
+                    titleLink.href = novel.source_url;
+                    titleLink.textContent = novel.title;
+                    titleLink.target = '_blank'; // Open link in new tab
+                    listItem.appendChild(titleLink);
+
+                    // Add Author
+                    if (novel.author_name) {
+                        const authorPara = document.createElement('p');
+                        authorPara.textContent = `Author: ${novel.author_name}`;
+                        listItem.appendChild(authorPara);
+                    }
+
+                    // Add Genres
+                    if (novel.genres && novel.genres.length > 0) {
+                        const genresPara = document.createElement('p');
+                        genresPara.textContent = `Genres: ${novel.genres.join(', ')}`;
+                        listItem.appendChild(genresPara);
+                    }
+
+                    // Add Synopsis
+                    if (novel.synopsis) {
+                        const synopsisPara = document.createElement('p');
+                        synopsisPara.textContent = `Synopsis: ${novel.synopsis.substring(0, 200)}...`; // Truncate synopsis for display
+                        listItem.appendChild(synopsisPara);
+                    }
+
+
                     novelsListUl.appendChild(listItem);
                 });
             }

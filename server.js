@@ -58,66 +58,173 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-app.post('/convert', async (req, res) => { // Made async to use await
-    const url = req.body.url;
-    console.log('Received URL for conversion:', url);
+app.post('/convert', async (req, res) => {
+    const sitemapUrl = req.body.url; // Expecting sitemap URL now
+    console.log('Received Sitemap URL for scraping:', sitemapUrl);
 
-    if (!url) {
-        return res.status(400).json({ message: 'URL is required' });
+    if (!sitemapUrl) {
+        return res.status(400).json({ message: 'Sitemap URL is required' });
     }
 
     try {
-        // Fetch the web page content
-        const response = await axios.get(url);
-        const html = response.data;
+        // Fetch the sitemap content
+        const sitemapResponse = await axios.get(sitemapUrl);
+        const sitemapXml = sitemapResponse.data;
 
-        // Load the HTML into cheerio
-        const $ = cheerio.load(html);
-
-        const novels = [];
-        $('.list.list-novel.col-xs-12 .row .col-xs-7 .novel-title a').each((i, element) => {
-            const title = $(element).text().trim();
-            const novelUrl = $(element).attr('href');
-            if (title && novelUrl) {
-                novels.push({ title, source_url: novelUrl });
+        // Parse the sitemap XML to extract novel URLs
+        const $sitemap = cheerio.load(sitemapXml, { xmlMode: true });
+        const novelUrls = [];
+        $sitemap('loc').each((i, element) => {
+            const url = $sitemap(element).text();
+            // Filter for novel URLs, assuming they contain '/novel/'
+            if (url.includes('/novel/') && !url.includes('/chapter/')) {
+                 novelUrls.push(url);
             }
         });
 
-        console.log(`Found ${novels.length} novels on ${url}`);
+        console.log(`Found ${novelUrls.length} potential novel URLs in the sitemap.`);
 
-        // Save novels to the database
-        const stmt = db.prepare('INSERT OR IGNORE INTO novels (title, source_url) VALUES (?, ?)');
-        novels.forEach(novel => {
-            stmt.run(novel.title, novel.source_url, function(err) {
-                if (err) {
-                    console.error(`Error inserting novel ${novel.title}:`, err.message);
-                } else if (this.changes > 0) {
-                    console.log(`Inserted novel: ${novel.title}`);
-                } else {
-                    console.log(`Novel already exists: ${novel.title}`);
+        const scrapedNovels = [];
+        const stmt = db.prepare('INSERT OR IGNORE INTO novels (title, source_url, synopsis, cover_image_url, author_id) VALUES (?, ?, ?, ?, ?)');
+        const genreStmt = db.prepare('INSERT OR IGNORE INTO genres (name) VALUES (?)');
+        const novelGenreStmt = db.prepare('INSERT OR IGNORE INTO novel_genres (novel_id, genre_id) VALUES (?, ?)');
+        const authorStmt = db.prepare('INSERT OR IGNORE INTO authors (name) VALUES (?)');
+
+        for (const novelUrl of novelUrls) {
+            try {
+                console.log(`Scraping novel page: ${novelUrl}`);
+                const novelPageResponse = await axios.get(novelUrl);
+                const novelPageHtml = novelPageResponse.data;
+                const $novelPage = cheerio.load(novelPageHtml);
+
+                const title = $novelPage('.col-info-desc .desc .title').text().trim();
+                const synopsis = $novelPage('.desc-text').text().trim();
+                const coverImageUrl = $novelPage('.books .book img.lazy').attr('data-src');
+                const authorName = $novelPage('.info-meta a[href*="/nov-love-author/"]').text().trim();
+                const genres = [];
+                $novelPage('.info-meta a[href*="/nov-love-genres/"]').each((i, element) => {
+                    genres.push($novelPage(element).text().trim());
+                });
+
+                if (title && novelUrl) {
+                    // Insert or get author ID
+                    let authorId = null;
+                    if (authorName) {
+                        const authorRow = await new Promise((resolve, reject) => {
+                            db.get('SELECT id FROM authors WHERE name = ?', [authorName], (err, row) => {
+                                if (err) reject(err);
+                                else resolve(row);
+                            });
+                        });
+
+                        if (authorRow) {
+                            authorId = authorRow.id;
+                        } else {
+                             await new Promise((resolve, reject) => {
+                                authorStmt.run(authorName, function(err) {
+                                    if (err) reject(err);
+                                    else resolve(this.lastID);
+                                });
+                            }).then(lastID => authorId = lastID).catch(err => console.error('Error inserting author:', err.message));
+                        }
+                    }
+
+                    // Insert or ignore novel
+                    await new Promise((resolve, reject) => {
+                        stmt.run(title, novelUrl, synopsis, coverImageUrl, authorId, function(err) {
+                            if (err) reject(err);
+                            else resolve(this.lastID);
+                        });
+                    }).then(novelId => {
+                        if (novelId) {
+                            console.log(`Inserted novel: ${title}`);
+                            scrapedNovels.push({ title, source_url: novelUrl, synopsis, cover_image_url: coverImageUrl, author_id: authorId, genres });
+
+                            // Insert or ignore genres and link to novel
+                            genres.forEach(async (genreName) => {
+                                let genreId = null;
+                                const genreRow = await new Promise((resolve, reject) => {
+                                    db.get('SELECT id FROM genres WHERE name = ?', [genreName], (err, row) => {
+                                        if (err) reject(err);
+                                        else resolve(row);
+                                    });
+                                });
+
+                                if (genreRow) {
+                                    genreId = genreRow.id;
+                                } else {
+                                     await new Promise((resolve, reject) => {
+                                        genreStmt.run(genreName, function(err) {
+                                            if (err) reject(err);
+                                            else resolve(this.lastID);
+                                        });
+                                    }).then(lastID => genreId = lastID).catch(err => console.error('Error inserting genre:', err.message));
+                                }
+
+                                if (genreId) {
+                                    novelGenreStmt.run(novelId, genreId, function(err) {
+                                        if (err) console.error(`Error linking novel ${title} to genre ${genreName}:`, err.message);
+                                    });
+                                }
+                            });
+                        } else {
+                            console.log(`Novel already exists: ${title}`);
+                        }
+                    }).catch(err => console.error(`Error inserting novel ${title}:`, err.message));
+
                 }
-            });
-        });
+            } catch (scrapeError) {
+                console.error(`Error scraping novel page ${novelUrl}:`, scrapeError.message);
+            }
+        }
+
         stmt.finalize();
+        genreStmt.finalize();
+        novelGenreStmt.finalize();
+        authorStmt.finalize();
 
-        console.log(`Attempted to save ${novels.length} novels to the database.`);
+        console.log(`Attempted to scrape and save ${novelUrls.length} novels. Successfully processed ${scrapedNovels.length} new/updated novels.`);
 
-        // TODO: Implement EPUB generation using epub-gen
-
-        res.json({ message: `Scraped ${novels.length} novels and attempted to save to database.`, novels_count: novels.length });
+        res.json({ message: `Attempted to scrape ${novelUrls.length} novels from sitemap. Successfully processed ${scrapedNovels.length} new/updated novels.`, novels_count: scrapedNovels.length });
 
     } catch (error) {
-        console.error('Error during conversion:', error.message);
-        res.status(500).json({ message: 'Error processing URL', error: error.message });
+        console.error('Error during sitemap processing or scraping:', error.message);
+        res.status(500).json({ message: 'Error processing sitemap or scraping novels', error: error.message });
     }
 });
 app.get('/api/novels', (req, res) => {
-    db.all('SELECT id, title, source_url FROM novels', [], (err, rows) => {
+    const query = `
+        SELECT
+            n.id,
+            n.title,
+            n.source_url,
+            n.synopsis,
+            n.cover_image_url,
+            a.name AS author_name
+        FROM novels n
+        LEFT JOIN authors a ON n.author_id = a.id
+    `;
+    db.all(query, [], async (err, novels) => {
         if (err) {
             console.error('Error retrieving novels:', err.message);
             res.status(500).json({ message: 'Error retrieving novels', error: err.message });
         } else {
-            res.json(rows);
+            // For each novel, fetch its genres
+            for (const novel of novels) {
+                const genreQuery = `
+                    SELECT g.name
+                    FROM genres g
+                    JOIN novel_genres ng ON g.id = ng.genre_id
+                    WHERE ng.novel_id = ?
+                `;
+                novel.genres = await new Promise((resolve, reject) => {
+                    db.all(genreQuery, [novel.id], (err, genreRows) => {
+                        if (err) reject(err);
+                        else resolve(genreRows.map(row => row.name));
+                    });
+                });
+            }
+            res.json(novels);
         }
     });
 });
